@@ -20,7 +20,7 @@ all:
 #include <math.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
-#include <libkms/libkms.h>
+#include <gbm.h>
 #include <cairo/cairo.h>
 
 struct flip_context{
@@ -88,61 +88,51 @@ void draw_buffer_with_cairo(char *addr, int w, int h, int pitch)
 	cairo_destroy(cr);
 }
 
-void create_bo(struct kms_driver *kms_driver, 
-	int w, int h, int *out_pitch, struct kms_bo **out_kms_bo, 
+void create_bo(struct gbm_device *gbm,
+	int w, int h, int format, int flags,
+    int *out_pitch, struct gbm_bo **out_gbm_bo,
 	int *out_handle, draw_func_t draw)
 {
-	void *map_buf;
-	struct kms_bo *bo;
-	int pitch, handle;
-	unsigned bo_attribs[] = {
-		KMS_WIDTH,   w,
-		KMS_HEIGHT,  h,
-		KMS_BO_TYPE, KMS_BO_TYPE_SCANOUT_X8R8G8B8,
-		KMS_TERMINATE_PROP_LIST
-	};
-	int ret;
+	void *map_buf = NULL;
+    void *data = NULL;
+    uint32_t stride = 0;
 
-	/* ceate kms buffer object, opaque struct identied by struct kms_bo pointer */
-	ret = kms_bo_create(kms_driver, bo_attribs, &bo);
-	if(ret){
-		fprintf(stderr, "kms_bo_create failed: %s\n", strerror(errno));
+	/* ceate generic buffer object, opaque struct identied by struct gbm_bo pointer */
+	struct gbm_bo *bo = gbm_bo_create(gbm, w, h, format, flags);
+	if(!bo){
+		fprintf(stderr, "gbm_bo_create failed: %s\n", strerror(errno));
 		goto exit;
 	}
 
-	/* get the "pitch" or "stride" of the bo */
-	ret = kms_bo_get_prop(bo, KMS_PITCH, &pitch);
-	if(ret){
-		fprintf(stderr, "kms_bo_get_prop KMS_PITCH failed: %s\n", strerror(errno));
-		goto free_bo;
-	}
-
 	/* get the handle of the bo */
-	ret = kms_bo_get_prop(bo, KMS_HANDLE, &handle);
-	if(ret){
-		fprintf(stderr, "kms_bo_get_prop KMS_HANDL failed: %s\n", strerror(errno));
+	union gbm_bo_handle handle = gbm_bo_get_handle(bo);
+	if(-1 == handle.s32){
+		fprintf(stderr, "gbm_bo_get_handle failed: %s\n", strerror(errno));
 		goto free_bo;
 	}
 
-	/* map the bo to user space buffer */
-	ret = kms_bo_map(bo, &map_buf);
-	if(ret){
-		fprintf(stderr, "kms_bo_map failed: %s\n", strerror(errno));
+	/* map the bo to user space buffer
+     * note that (1)the passed flags is for creation, not for mapping
+     * (2) `map_buf` is not the same thing with `data` in regard to gbm_bo_map(),
+     * and the latter must be passed to gbm_bo_unmap().
+     */
+	map_buf = gbm_bo_map(bo, 0, 0, w, h, GBM_BO_TRANSFER_WRITE, &stride, &data);
+	if(!map_buf){
+		fprintf(stderr, "gbm_bo_map failed: %s\n", strerror(errno));
 		goto free_bo;
 	}
 
-	draw(map_buf, w, h, pitch);
+	draw(map_buf, w, h, stride);
 
-	kms_bo_unmap(bo);
+	gbm_bo_unmap(bo, data);
 
-	ret = 0;
-	*out_kms_bo = bo;
-	*out_pitch = pitch;
-	*out_handle = handle;
+	*out_gbm_bo = bo;
+	*out_pitch = stride;
+	*out_handle = handle.u32;
 	goto exit;
 
 free_bo:
-	kms_bo_destroy(&bo);
+	gbm_bo_destroy(bo);
 	
 exit:
 	return;
@@ -185,8 +175,8 @@ int main(int argc, char *argv[])
 	drmModeEncoder *encoder = NULL;
 	drmModeModeInfo mode;
 	drmModeCrtcPtr orig_crtc;
-	struct kms_driver *kms_driver;
-	struct kms_bo *kms_bo, *second_kms_bo;
+	struct gbm_device *gbm;
+	struct gbm_bo *gbm_bo, *second_gbm_bo;
 	void *map_buf;
 	int ret, i;
 	
@@ -243,15 +233,15 @@ int main(int argc, char *argv[])
 		goto free_drm_res;
 	}
 
-	/* init kms bo stuff */	
-	ret = kms_create(fd, &kms_driver);
-	if(ret){
-		fprintf(stderr, "kms_create failed: %s\n", strerror(errno));
+	/* init gbm bo stuff */
+	gbm = gbm_create_device(fd);
+	if(!gbm){
+		fprintf(stderr, "gbm_create_device failed: %s\n", strerror(errno));
 		goto free_drm_res;
 	}
 
-	create_bo(kms_driver, mode.hdisplay, mode.vdisplay, 
-		&pitch, &kms_bo, &bo_handle, draw_buffer);
+	create_bo(gbm, mode.hdisplay, mode.vdisplay, GBM_BO_FORMAT_ARGB8888, GBM_BO_USE_SCANOUT,
+		&pitch, &gbm_bo, &bo_handle, draw_buffer);
 
 	/* add FB which is associated with bo */
 	ret = drmModeAddFB(fd, mode.hdisplay, mode.vdisplay, 24, 32, pitch, bo_handle, &fb_id);
@@ -277,8 +267,8 @@ int main(int argc, char *argv[])
 		goto free_first_fb;
 	}
 
-	create_bo(kms_driver, mode.hdisplay, mode.vdisplay, 
-		&pitch, &second_kms_bo, &bo_handle, draw_buffer_with_cairo);
+	create_bo(gbm, mode.hdisplay, mode.vdisplay, GBM_BO_FORMAT_ARGB8888, GBM_BO_USE_SCANOUT,
+		&pitch, &second_gbm_bo, &bo_handle, draw_buffer_with_cairo);
 
 	/* add another FB which is associated with bo */
 	ret = drmModeAddFB(fd, mode.hdisplay, mode.vdisplay, 24, 32, pitch, bo_handle, &second_fb_id);
@@ -362,16 +352,16 @@ free_second_fb:
 	drmModeRmFB(fd, second_fb_id);
 	
 free_second_bo:
-	kms_bo_destroy(&second_kms_bo);
+	gbm_bo_destroy(second_gbm_bo);
 	
 free_first_fb:
 	drmModeRmFB(fd, fb_id);
 	
 free_first_bo:
-	kms_bo_destroy(&kms_bo);
+	gbm_bo_destroy(gbm_bo);
 
 free_kms_driver:
-	kms_destroy(&kms_driver);
+	gbm_device_destroy(gbm);
 	
 free_drm_res:
 	drmModeFreeEncoder(encoder);
